@@ -19,6 +19,7 @@ from boltz.data.types import (
     Record,
     ResidueConstraints,
     Structure,
+    Tokenized,
 )
 
 
@@ -127,6 +128,7 @@ class PredictionDataset(torch.utils.data.Dataset):
         target_dir: Path,
         msa_dir: Path,
         constraints_dir: Optional[Path] = None,
+        masking_config: Optional[dict] = None,
     ) -> None:
         """Initialize the training dataset.
 
@@ -145,6 +147,7 @@ class PredictionDataset(torch.utils.data.Dataset):
         self.target_dir = target_dir
         self.msa_dir = msa_dir
         self.constraints_dir = constraints_dir
+        self.masking_config = masking_config
         self.tokenizer = BoltzTokenizer()
         self.featurizer = BoltzFeaturizer()
 
@@ -178,6 +181,41 @@ class PredictionDataset(torch.utils.data.Dataset):
         except Exception as e:  # noqa: BLE001
             print(f"Tokenizer failed on {record.id} with error {e}. Skipping.")  # noqa: T201
             return self.__getitem__(0)
+
+        # Apply mutations to target sequence only (if configured and not regenerating MSA)
+        if self.masking_config and self.masking_config.get("mutations"):
+            try:
+                from boltz.data.utils.mutation_masking import apply_mutations_to_tokenized
+                tokenized = apply_mutations_to_tokenized(tokenized, self.masking_config["mutations"])
+                print(f"Applied {len(self.masking_config['mutations'])} mutations to target sequence only for {record.id}")  # noqa: T201
+            except Exception as e:  # noqa: BLE001
+                print(f"Target mutation failed on {record.id} with error {e}. Proceeding without mutations.")  # noqa: T201
+
+        # Apply masking if configured
+        if self.masking_config and self.masking_config.get("mask_positions"):
+            try:
+                from boltz.data.utils.mutation_masking import apply_masking_to_msa
+                masked_msa = apply_masking_to_msa(
+                    tokenized.msa,
+                    self.masking_config["mask_positions"],
+                    self.masking_config["mask_token"],
+                    self.masking_config["mask_deletion_matrix"],
+                )
+                # Create new tokenized object with masked MSA
+                tokenized = Tokenized(
+                    tokens=tokenized.tokens,
+                    bonds=tokenized.bonds,
+                    structure=tokenized.structure,
+                    msa=masked_msa,
+                    record=tokenized.record,
+                    residue_constraints=tokenized.residue_constraints,
+                    templates=tokenized.templates,
+                    template_tokens=tokenized.template_tokens,
+                    template_bonds=tokenized.template_bonds,
+                    extra_mols=tokenized.extra_mols,
+                )
+            except Exception as e:  # noqa: BLE001
+                print(f"MSA masking failed on {record.id} with error {e}. Proceeding without masking.")  # noqa: T201
 
         # Inference specific options
         options = record.inference_options
@@ -230,6 +268,7 @@ class BoltzInferenceDataModule(pl.LightningDataModule):
         msa_dir: Path,
         num_workers: int,
         constraints_dir: Optional[Path] = None,
+        masking_config: Optional[dict] = None,
     ) -> None:
         """Initialize the DataModule.
 
@@ -245,6 +284,7 @@ class BoltzInferenceDataModule(pl.LightningDataModule):
         self.target_dir = target_dir
         self.msa_dir = msa_dir
         self.constraints_dir = constraints_dir
+        self.masking_config = masking_config
 
     def predict_dataloader(self) -> DataLoader:
         """Get the training dataloader.
@@ -260,6 +300,7 @@ class BoltzInferenceDataModule(pl.LightningDataModule):
             target_dir=self.target_dir,
             msa_dir=self.msa_dir,
             constraints_dir=self.constraints_dir,
+            masking_config=self.masking_config,
         )
         return DataLoader(
             dataset,

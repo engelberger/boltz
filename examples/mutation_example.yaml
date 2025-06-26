@@ -1,0 +1,16 @@
+version: 1
+sequences:
+  - protein:
+      id: A
+      sequence: MVTPEGNVSLVDESLLVGVTDEDRAVRSAHQFYERLIGLWAPAVMEAAHELGVFAALAEAPADS
+      msa: empty  # Use single sequence mode for this example
+  - ligand:
+      id: B
+      smiles: 'CC1=CC=CC=C1'  # Simple toluene molecule
+
+# Example showing how masking could be supported in YAML (not yet implemented)
+# masking:
+#   chain: A
+#   positions: "10-15,20,30"
+#   mask_deletion_matrix: true
+#   mask_token: X 

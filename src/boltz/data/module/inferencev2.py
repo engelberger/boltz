@@ -21,6 +21,7 @@ from boltz.data.types import (
     Record,
     ResidueConstraints,
     StructureV2,
+    Tokenized,
 )
 
 
@@ -168,6 +169,7 @@ class PredictionDataset(torch.utils.data.Dataset):
         extra_mols_dir: Optional[Path] = None,
         override_method: Optional[str] = None,
         affinity: bool = False,
+        masking_config: Optional[dict] = None,
     ) -> None:
         """Initialize the training dataset.
 
@@ -200,6 +202,7 @@ class PredictionDataset(torch.utils.data.Dataset):
         self.extra_mols_dir = extra_mols_dir
         self.override_method = override_method
         self.affinity = affinity
+        self.masking_config = masking_config
         if self.affinity:
             self.cropper = AffinityCropper()
 
@@ -234,6 +237,41 @@ class PredictionDataset(torch.utils.data.Dataset):
                 f"Tokenizer failed on {record.id} with error {e}. Skipping."
             )
             return self.__getitem__(0)
+
+        # Apply mutations to target sequence only (if configured and not regenerating MSA)
+        if self.masking_config and self.masking_config.get("mutations"):
+            try:
+                from boltz.data.utils.mutation_masking import apply_mutations_to_tokenized
+                tokenized = apply_mutations_to_tokenized(tokenized, self.masking_config["mutations"])
+                print(f"Applied {len(self.masking_config['mutations'])} mutations to target sequence only for {record.id}")  # noqa: T201
+            except Exception as e:  # noqa: BLE001
+                print(f"Target mutation failed on {record.id} with error {e}. Proceeding without mutations.")  # noqa: T201
+
+        # Apply masking if configured
+        if self.masking_config and self.masking_config.get("mask_positions"):
+            try:
+                from boltz.data.utils.mutation_masking import apply_masking_to_msa
+                masked_msa = apply_masking_to_msa(
+                    tokenized.msa,
+                    self.masking_config["mask_positions"],
+                    self.masking_config["mask_token"],
+                    self.masking_config["mask_deletion_matrix"],
+                )
+                # Create new tokenized object with masked MSA
+                tokenized = Tokenized(
+                    tokens=tokenized.tokens,
+                    bonds=tokenized.bonds,
+                    structure=tokenized.structure,
+                    msa=masked_msa,
+                    record=tokenized.record,
+                    residue_constraints=tokenized.residue_constraints,
+                    templates=tokenized.templates,
+                    template_tokens=tokenized.template_tokens,
+                    template_bonds=tokenized.template_bonds,
+                    extra_mols=tokenized.extra_mols,
+                )
+            except Exception as e:  # noqa: BLE001
+                print(f"MSA masking failed on {record.id} with error {e}. Proceeding without masking.")  # noqa: T201
 
         if self.affinity:
             try:
@@ -325,6 +363,7 @@ class Boltz2InferenceDataModule(pl.LightningDataModule):
         extra_mols_dir: Optional[Path] = None,
         override_method: Optional[str] = None,
         affinity: bool = False,
+        masking_config: Optional[dict] = None,
     ) -> None:
         """Initialize the DataModule.
 
@@ -361,6 +400,7 @@ class Boltz2InferenceDataModule(pl.LightningDataModule):
         self.extra_mols_dir = extra_mols_dir
         self.override_method = override_method
         self.affinity = affinity
+        self.masking_config = masking_config
 
     def predict_dataloader(self) -> DataLoader:
         """Get the training dataloader.
@@ -381,6 +421,7 @@ class Boltz2InferenceDataModule(pl.LightningDataModule):
             extra_mols_dir=self.extra_mols_dir,
             override_method=self.override_method,
             affinity=self.affinity,
+            masking_config=self.masking_config,
         )
         return DataLoader(
             dataset,

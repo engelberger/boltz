@@ -496,6 +496,8 @@ def process_input(  # noqa: C901, PLR0912, PLR0915, D103
     processed_mols_dir: Path,
     structure_dir: Path,
     records_dir: Path,
+    mutations: Optional[str] = None,
+    mutate_msa_query: bool = False,
 ) -> None:
     try:
         # Parse data
@@ -515,6 +517,17 @@ def process_input(  # noqa: C901, PLR0912, PLR0915, D103
 
         # Get target id
         target_id = target.record.id
+        
+        # Apply mutations if specified and user wants to regenerate MSA with mutated sequence
+        if mutations and mutate_msa_query:
+            from boltz.data.utils.mutation_masking import parse_mutation_string, apply_mutations_to_target
+            try:
+                parsed_mutations = parse_mutation_string(mutations)
+                if parsed_mutations:
+                    target = apply_mutations_to_target(target, parsed_mutations)
+                    click.echo(f"Applied {len(parsed_mutations)} mutations to {path} (MSA will be regenerated)")
+            except Exception as e:
+                raise RuntimeError(f"Failed to apply mutations to {path}: {e}") from e
 
         # Get all MSA ids and decide whether to generate MSA
         to_generate = {}
@@ -623,6 +636,8 @@ def process_inputs(
     use_msa_server: bool = False,
     boltz2: bool = False,
     preprocessing_threads: int = 1,
+    mutations: Optional[str] = None,
+    mutate_msa_query: bool = False,
 ) -> Manifest:
     """Process the input data and output directory.
 
@@ -713,6 +728,8 @@ def process_inputs(
         processed_mols_dir=processed_mols_dir,
         structure_dir=structure_dir,
         records_dir=records_dir,
+        mutations=mutations,
+        mutate_msa_query=mutate_msa_query,
     )
 
     # Parse input data
@@ -934,6 +951,39 @@ def cli() -> None:
     is_flag=True,
     help="Whether to disable the kernels. Default False",
 )
+@click.option(
+    "--mutations",
+    type=str,
+    help="Comma-separated list of mutations (e.g., 'A123G,R45C' or 'A:G10C,B:R20D')",
+    default=None,
+)
+@click.option(
+    "--mask_positions",
+    type=str,
+    help="Positions to mask in MSA (e.g., '10-15,20,30')",
+    default=None,
+)
+@click.option(
+    "--mask_msa",
+    is_flag=True,
+    help="Enable MSA masking at specified positions",
+)
+@click.option(
+    "--mask_deletion_matrix",
+    is_flag=True,
+    help="Enable deletion matrix masking at specified positions",
+)
+@click.option(
+    "--mask_token",
+    type=click.Choice(["A", "R", "N", "D", "C", "E", "Q", "G", "H", "I", "L", "K", "M", "F", "P", "S", "T", "W", "Y", "V", "X", "-"]),
+    help="Character to use for masking",
+    default="X",
+)
+@click.option(
+    "--mutate_msa_query",
+    is_flag=True,
+    help="Regenerate MSA using the mutated sequence (default: only mutate target, keep original MSA)",
+)
 def predict(  # noqa: C901, PLR0915, PLR0912
     data: str,
     out_dir: str,
@@ -967,6 +1017,12 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     subsample_msa: bool = True,
     num_subsampled_msa: int = 1024,
     no_kernels: bool = False,
+    mutations: Optional[str] = None,
+    mask_positions: Optional[str] = None,
+    mask_msa: bool = False,
+    mask_deletion_matrix: bool = False,
+    mask_token: str = "X",
+    mutate_msa_query: bool = False,
 ) -> None:
     """Run predictions with Boltz."""
     # If cpu, write a friendly warning
@@ -1029,6 +1085,23 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             msg = f"Method {method} not supported. Supported: {method_names}"
             raise ValueError(msg)
 
+    # Create masking and mutation configuration
+    masking_config = None
+    if mask_positions or mask_msa or mask_deletion_matrix or (mutations and not mutate_msa_query):
+        from boltz.data.utils.mutation_masking import parse_masking_positions, parse_mutation_string, validate_masking_config
+        masking_config = {
+            "mask_positions": parse_masking_positions(mask_positions or ""),
+            "mask_msa": mask_msa,
+            "mask_deletion_matrix": mask_deletion_matrix,
+            "mask_token": mask_token,
+            "mutations": parse_mutation_string(mutations or "") if mutations and not mutate_msa_query else [],
+        }
+        masking_config = validate_masking_config(masking_config)
+        if masking_config["mask_positions"]:
+            click.echo(f"Will apply MSA masking to positions: {[p+1 for p in masking_config['mask_positions']]}")
+        if masking_config["mutations"]:
+            click.echo(f"Will apply mutations to target sequence only: {mutations} (keeping original MSA)")
+
     # Process inputs
     ccd_path = cache / "ccd.pkl"
     mol_dir = cache / "mols"
@@ -1043,6 +1116,8 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         boltz2=model == "boltz2",
         preprocessing_threads=preprocessing_threads,
         max_msa_seqs=max_msa_seqs,
+        mutations=mutations,
+        mutate_msa_query=mutate_msa_query,
     )
 
     # Load manifest
@@ -1147,6 +1222,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
                 template_dir=processed.template_dir,
                 extra_mols_dir=processed.extra_mols_dir,
                 override_method=method,
+                masking_config=masking_config,
             )
         else:
             data_module = BoltzInferenceDataModule(
@@ -1155,6 +1231,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
                 msa_dir=processed.msa_dir,
                 num_workers=num_workers,
                 constraints_dir=processed.constraints_dir,
+                masking_config=masking_config,
             )
 
         # Load model
@@ -1172,6 +1249,9 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             "write_confidence_summary": True,
             "write_full_pae": write_full_pae,
             "write_full_pde": write_full_pde,
+            "capture_representations": {
+                "capture_recycling_steps": [0, 1]
+            },
         }
 
         steering_args = BoltzSteeringParams()
@@ -1235,6 +1315,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             extra_mols_dir=processed.extra_mols_dir,
             override_method="other",
             affinity=True,
+            masking_config=masking_config,
         )
 
         predict_affinity_args = {
